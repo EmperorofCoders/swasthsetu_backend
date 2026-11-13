@@ -7,9 +7,19 @@ import os
 import psycopg
 from psycopg.types.json import Jsonb
 import requests
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 BASE = "https://api.sarvam.ai/doc-ai/v1"
+missing_environment = [
+    name for name in ("SARVAM_API_KEY", "DATABASE_URL") if not os.environ.get(name)
+]
+if missing_environment:
+    raise SystemExit("Missing required environment variable(s): " + ", ".join(missing_environment))
+
 HEADERS = {"api-subscription-key": os.environ["SARVAM_API_KEY"]}
+DATABASE_URL = os.environ["DATABASE_URL"]
 TERMINAL = {"completed", "partially_completed", "failed", "rejected"}
 
 SCHEMA = """{
@@ -522,7 +532,13 @@ print(f"Job created: {job_id}")
 
 # Poll until the job reaches a terminal status.
 while True:
-    status = requests.get(f"{BASE}/job/{job_id}/status", headers=HEADERS, timeout=30).json()
+    status_response = requests.get(
+        f"{BASE}/job/{job_id}/status",
+        headers=HEADERS,
+        timeout=30,
+    )
+    status_response.raise_for_status()
+    status = status_response.json()
     usage = status["usage"]
     print(f'{status["status"]} — {usage["pages_processed"]}/{usage["pages_total"]} pages')
     if status["status"] in TERMINAL:
@@ -534,18 +550,20 @@ if status["status"] in {"failed", "rejected"}:
 
 # Read the extracted fields. `annotations` mirrors `result`, with
 # `confidence` and `sources` on every leaf.
-results = requests.get(
+results_response = requests.get(
     f"{BASE}/job/{job_id}/results",
     headers=HEADERS,
     params={"format": "json"},
     timeout=60,
-).json()
+)
+results_response.raise_for_status()
+results = results_response.json()
 if "result" not in results:
     raise ValueError("The API response did not include a 'result' object.")
 
 extracted_result = omit_empty_values(results["result"])
 
-with psycopg.connect(os.environ["DATABASE_URL"]) as connection:
+with psycopg.connect(DATABASE_URL) as connection:
     with connection.cursor() as cursor:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS public.medical_document_extractions (
@@ -567,9 +585,8 @@ with psycopg.connect(os.environ["DATABASE_URL"]) as connection:
 
 
 
-print(json.dumps(extracted_result, indent=2, ensure_ascii=False))
-
 sql_output = build_sql_export(document_path.name, extracted_result)
 with sql_output_path.open("x", encoding="utf-8", newline="\n") as sql_file:
     sql_file.write(sql_output)
 print(f"PostgreSQL SQL export written to: {sql_output_path}")
+print("EXTRACTED_RESULT_JSON=" + json.dumps(extracted_result, indent=2, ensure_ascii=False))

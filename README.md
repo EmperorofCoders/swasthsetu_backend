@@ -39,3 +39,20 @@ uses different names.
 The explanation is educational only and does not replace advice from a
 qualified healthcare professional.
 
+## Medical document scanner UI
+
+Install the dependencies with `python -m pip install -r requirements.txt`.
+Create a local `.env` file in the project root with `SARVAM_API_KEY` and
+`DATABASE_URL` (the `.env` file is ignored by Git), or set those variables in
+the environment. Start the uploader with:
+
+```bash
+python -m streamlit run streamlit_app.py
+```
+
+The UI accepts one PDF, JPG, or JPEG at a time. It invokes `record.py`, which
+extracts the document fields and saves them to
+`public.medical_document_extractions`. The uploaded file is held in a temporary
+directory during scanning; the UI also offers the generated SQL export for
+download.
+
