@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@calcom/sdk": "^1.0.1",
+    "pg": "^8.23.1"
+  }
+}

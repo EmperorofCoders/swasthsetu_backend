@@ -3,7 +3,7 @@
 The workflow is:
 
 1. Read one patient record from Supabase.
-2. Ask a chat model to explain the record in simple language.
+2. Ask Sarvam's 105B chat model to explain the record in simple language.
 3. Translate the explanation with Sarvam.
 4. Convert the translated explanation to speech with Sarvam.
 
@@ -20,11 +20,13 @@ from pathlib import Path
 import re
 from typing import Any
 
+import psycopg
+from psycopg.rows import dict_row
 import requests
 
 
-DEFAULT_EXPLANATION_MODEL = "mistralai/mistral-large-4-1t-a52b"
-DEFAULT_EXPLANATION_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+DEFAULT_EXPLANATION_MODEL = "sarvam-105b-conversations"
+DEFAULT_EXPLANATION_URL = "https://api.sarvam.ai/v2/chat/completions"
 DEFAULT_TRANSLATION_MODEL = "mayura:v1"
 DEFAULT_TTS_MODEL = "bulbul:v4-flash"
 
@@ -40,81 +42,72 @@ def required_env(name: str) -> str:
     return value
 
 
-def fetch_patient_record(patient_code: int) -> dict[str, Any]:
-    """Fetch one patient record from the configured Supabase table."""
+def database_identifier(name: str, variable_name: str) -> str:
+    """Validate a configured PostgreSQL identifier before interpolating it."""
 
-    supabase_url = required_env("SUPABASE_URL").rstrip("/")
-    supabase_key = required_env("SUPABASE_KEY")
-    table_name = os.getenv("SUPABASE_TABLE", "patients")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise ValueError(f"Invalid SQL identifier in {variable_name}: {name!r}")
+    return name
 
-    response = requests.get(
-        f"{supabase_url}/rest/v1/{table_name}",
-        headers={
-            "apikey": supabase_key,
-            "Authorization": f"Bearer {supabase_key}",
-            "Accept-Profile": "public",
-        },
-        params={
-            "patient_code": f"eq.{patient_code}",
-            "select": "*",
-            "limit": "1",
-        },
-        timeout=30,
+
+def fetch_one_record(
+    table_name: str,
+    lookup_column: str,
+    lookup_value: object,
+    not_found_message: str,
+) -> dict[str, Any]:
+    """Fetch one row from PostgreSQL using the configured database URI."""
+
+    database_url = required_env("DATABASE_URL")
+    table_name = database_identifier(table_name, "SUPABASE_TABLE")
+    lookup_column = database_identifier(lookup_column, "SUPABASE_LOOKUP_COLUMN")
+    query = (
+        f"SELECT * FROM public.{table_name} "
+        f"WHERE {lookup_column} = %s LIMIT 1"
     )
-    response.raise_for_status()
 
-    records = response.json()
-    if not records:
-        raise LookupError(f"No patient found for patient_code={patient_code}.")
-    return records[0]
+    with psycopg.connect(database_url, row_factory=dict_row) as connection:
+        record = connection.execute(query, (lookup_value,)).fetchone()
+
+    if record is None:
+        raise LookupError(not_found_message)
+    return dict(record)
+
+
+def fetch_patient_record(patient_code: int) -> dict[str, Any]:
+    """Fetch one patient record from the configured PostgreSQL table."""
+
+    table_name = os.getenv("SUPABASE_TABLE", "medical_records")
+    return fetch_one_record(
+        table_name=table_name,
+        lookup_column=os.getenv("SUPABASE_LOOKUP_COLUMN", "patient_code"),
+        lookup_value=patient_code,
+        not_found_message=f"No patient found for patient_code={patient_code}.",
+    )
 
 
 def fetch_hospital_request(request_id: str) -> dict[str, Any]:
-    """Fetch one hospital request from the configured Supabase table.
+    """Fetch one hospital request from the configured PostgreSQL table.
 
     By default this expects a ``hospital_requests`` table with a ``request_id``
     column. Set ``HOSPITAL_REQUESTS_TABLE`` and
     ``HOSPITAL_REQUEST_ID_COLUMN`` when the backend uses different names.
     """
 
-    supabase_url = required_env("SUPABASE_URL").rstrip("/")
-    supabase_key = required_env("SUPABASE_KEY")
     table_name = os.getenv("HOSPITAL_REQUESTS_TABLE", "hospital_requests")
     id_column = os.getenv("HOSPITAL_REQUEST_ID_COLUMN", "request_id")
-
-    for identifier, variable_name in (
-        (table_name, "HOSPITAL_REQUESTS_TABLE"),
-        (id_column, "HOSPITAL_REQUEST_ID_COLUMN"),
-    ):
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", identifier):
-            raise ValueError(f"Invalid SQL identifier in {variable_name}: {identifier!r}")
-
-    response = requests.get(
-        f"{supabase_url}/rest/v1/{table_name}",
-        headers={
-            "apikey": supabase_key,
-            "Authorization": f"Bearer {supabase_key}",
-            "Accept-Profile": "public",
-        },
-        params={
-            id_column: f"eq.{request_id}",
-            "select": "*",
-            "limit": "1",
-        },
-        timeout=30,
+    return fetch_one_record(
+        table_name=table_name,
+        lookup_column=id_column,
+        lookup_value=request_id,
+        not_found_message=f"No hospital request found for request_id={request_id!r}.",
     )
-    response.raise_for_status()
-
-    records = response.json()
-    if not records:
-        raise LookupError(f"No hospital request found for request_id={request_id!r}.")
-    return records[0]
 
 
 def explain_record(record: dict[str, Any]) -> str:
     """Generate a simple-language explanation of a health record."""
 
-    model_api_key = os.getenv("MODEL_API_KEY") or required_env("NVIDIA_API_KEY")
+    model_api_key = required_env("SARVAM_API_KEY")
     model_url = os.getenv("MODEL_API_URL", DEFAULT_EXPLANATION_URL)
     model_name = os.getenv("MODEL_NAME", DEFAULT_EXPLANATION_MODEL)
 
@@ -133,12 +126,13 @@ def explain_record(record: dict[str, Any]) -> str:
         f"Health record:\n{json.dumps(record_for_model, indent=2, default=str)}"
     )
 
-    response = requests.post(
+    explanation_parts: list[str] = []
+    with requests.post(
         model_url,
         headers={
-            "Authorization": f"Bearer {model_api_key}",
+            "api-subscription-key": model_api_key,
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Accept": "text/event-stream",
         },
         json={
             "model": model_name,
@@ -152,18 +146,44 @@ def explain_record(record: dict[str, Any]) -> str:
                 },
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.2,
-            "max_tokens": 1200,
+            "stream": True,
+            "temperature": 0.5,
+            "top_p": 0.95,
+            "max_tokens": 2048,
         },
+        stream=True,
         timeout=90,
-    )
-    response.raise_for_status()
+    ) as response:
+        response.raise_for_status()
 
-    result = response.json()
-    try:
-        return result["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError, TypeError) as error:
-        raise RuntimeError(f"Unexpected explanation-model response: {result}") from error
+        for line in response.iter_lines():
+            if not line:
+                continue
+            if isinstance(line, bytes):
+                line = line.decode("utf-8")
+            if not line.startswith("data:"):
+                continue
+
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+
+            try:
+                chunk = json.loads(data)
+                delta = chunk["choices"][0]["delta"]
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+                raise RuntimeError(
+                    f"Unexpected Sarvam explanation-stream chunk: {data}"
+                ) from error
+
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                explanation_parts.append(content)
+
+    explanation = "".join(explanation_parts).strip()
+    if not explanation:
+        raise RuntimeError("Sarvam chat model returned an empty explanation.")
+    return explanation
 
 
 def translate_text(text: str, target_language_code: str) -> str:

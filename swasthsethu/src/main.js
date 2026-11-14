@@ -1,4 +1,5 @@
 import { Clerk } from "@clerk/clerk-js";
+import { ui } from "@clerk/ui";
 
 const publishableKey = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
 
@@ -7,7 +8,7 @@ if (!publishableKey) {
 }
 
 const clerk = new Clerk(publishableKey);
-await clerk.load();
+await clerk.load({ ui: { ClerkUI: ui.ClerkUI } });
 
 // Static string literals with no user input — safe to use as markup
 if (clerk.user) {
