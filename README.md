@@ -39,20 +39,46 @@ uses different names.
 The explanation is educational only and does not replace advice from a
 qualified healthcare professional.
 
-## Medical document scanner UI
+## Medical document scanner portal
 
-Install the dependencies with `python -m pip install -r requirements.txt`.
-Create a local `.env` file in the project root with `SARVAM_API_KEY` and
-`DATABASE_URL` (the `.env` file is ignored by Git), or set those variables in
-the environment. Start the uploader with:
+The Vite portal in `swasthsethu/` uses Clerk for sign-in and sends uploads to
+the FastAPI service in `record.py`. The service accepts PDF, JPG, or JPEG
+documents, scans them with Sarvam Document AI, and stores the extracted record
+encrypted in `public.medical_document_extractions`.
+
+Configure the backend variables in a root `.env` file using `.env.example` as a
+template. Set `SARVAM_API_KEY`, `DATABASE_URL`, `DATA_ENCRYPTION_KEY`,
+`CLERK_ISSUER`, `CLERK_JWKS_URL`, and `CORS_ORIGINS`. Generate an encryption
+key with:
 
 ```bash
-python -m streamlit run streamlit_app.py
+python -c "from immunity import generate_encryption_key; print(generate_encryption_key())"
 ```
 
-The UI accepts one PDF, JPG, or JPEG at a time. It invokes `record.py`, which
-extracts the document fields and saves them to
-`public.medical_document_extractions`. The uploaded file is held in a temporary
-directory during scanning; the UI also offers the generated SQL export for
-download.
+Start the API from the repository root:
+
+```bash
+python -m pip install -r requirements.txt
+python -m uvicorn record:app --reload --host 0.0.0.0 --port 8000
+```
+
+Copy `swasthsethu/.env.example` to `swasthsethu/.env.local`, then set
+`VITE_CLERK_PUBLISHABLE_KEY` and `VITE_RECORD_API_URL=http://localhost:8000`.
+In a second terminal:
+
+```bash
+cd swasthsethu
+npm ci
+npm run dev
+```
+
+Sign in, enter a patient code, select a document, and choose **Scan document**.
+The portal displays the extracted JSON and lets you download it. The API derives
+the record owner from the verified Clerk token; it does not trust a submitted
+Clerk user ID. The patient-code-to-Clerk ownership mapping is not present in the
+current database schema, so the patient code itself is not validated against
+an existing patient account. The API also retains an authenticated
+`POST /upload-camera` endpoint for JPEG data URLs; camera images are encrypted
+and saved under an owner-specific directory. The portal UI currently uses the
+document scanner endpoint.
 

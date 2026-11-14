@@ -1,8 +1,12 @@
+import base64
+import binascii
+import hashlib
 import json
 import logging
 import time
 import tempfile
 import os
+import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -15,6 +19,7 @@ import jwt
 from jwt import PyJWKClient
 from immunity import DataProtector
 import psycopg
+from pydantic import BaseModel
 from psycopg.types.json import Jsonb
 import requests
 
@@ -23,6 +28,7 @@ load_dotenv(Path(__file__).resolve().with_name(".env"))
 BASE = "https://api.sarvam.ai/doc-ai/v1"
 TERMINAL = {"completed", "partially_completed", "failed", "rejected"}
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+UPLOAD_DIRECTORY = Path(__file__).resolve().parent / "uploads"
 logger = logging.getLogger(__name__)
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -38,6 +44,11 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+
+class CameraUploadRequest(BaseModel):
+    image: str
+
 
 SCHEMA = """{
   "type": "object",
@@ -515,7 +526,7 @@ def get_current_clerk_user(
             detail="Clerk token verification is not configured on the server.",
         )
 
-    audience = os.getenv("CLERK_AUDIENCE")
+    audience = os.getenv("CLERK_AUDIENCE") or None
     try:
         signing_key = get_jwks_client(jwks_url).get_signing_key_from_jwt(
             credentials.credentials
@@ -799,50 +810,62 @@ def upload_report(
         "patient_code": patient_code,
         "extracted_data": extracted_data,
     }
-# camera access
-from flask import Flask, request, jsonify
-import base64
-import os
-import uuid
-
-app = Flask(__name__)
-
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
-@app.route("/upload-camera", methods=["POST"])
-def upload_camera():
+@app.post("/upload-camera")
+def upload_camera(
+    payload: CameraUploadRequest,
+    clerk_user_id: str = Depends(get_current_clerk_user),
+) -> dict[str, Any]:
+    header, separator, encoded_image = payload.image.partition(",")
+    if not separator or header.lower() not in {
+        "data:image/jpeg;base64",
+        "data:image/jpg;base64",
+    }:
+        raise HTTPException(
+            status_code=415,
+            detail="Camera uploads must be JPEG data URLs.",
+        )
 
+    max_encoded_length = 4 * ((MAX_UPLOAD_BYTES + 2) // 3)
+    if len(encoded_image) > max_encoded_length:
+        raise HTTPException(
+            status_code=413,
+            detail="The camera image exceeds the configured size limit.",
+        )
     try:
-        data = request.json
+        image_bytes = base64.b64decode(encoded_image, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise HTTPException(status_code=400, detail="Invalid base64 camera image.") from error
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="The camera image is empty.")
+    if len(image_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="The camera image exceeds the configured size limit.",
+        )
+    if not image_bytes.startswith(b"\xff\xd8\xff"):
+        raise HTTPException(status_code=415, detail="The uploaded data is not a JPEG image.")
 
-        image_data = data["image"]
+    encrypted_image = get_data_protector().encrypt(image_bytes, clerk_user_id)
+    owner_directory = UPLOAD_DIRECTORY / hashlib.sha256(
+        clerk_user_id.encode("utf-8")
+    ).hexdigest()
+    filename = f"{uuid.uuid4().hex}.jpg.enc"
+    filepath = owner_directory / filename
+    try:
+        owner_directory.mkdir(parents=True, exist_ok=True)
+        with filepath.open("xb") as image_file:
+            image_file.write(encrypted_image)
+    except OSError as error:
+        logger.error("Camera image write failed.")
+        raise HTTPException(
+            status_code=503,
+            detail="The camera image could not be saved.",
+        ) from error
 
-        image_data = image_data.split(",")[1]
-
-        image_bytes = base64.b64decode(image_data)
-
-        filename = f"{uuid.uuid4()}.jpg"
-
-        filepath = os.path.join(UPLOAD_FOLDER, filename)
-
-        with open(filepath, "wb") as file:
-            file.write(image_bytes)
-
-        return jsonify({
-            "success": True,
-            "filename": filename,
-            "message": "Image uploaded successfully"
-        })
-
-    except Exception as e:
-
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 400
-
-
-if __name__ == "__main__":
-    app.run(debug=True)
+    return {
+        "success": True,
+        "filename": filename,
+        "message": "Camera image uploaded and encrypted successfully.",
+    }
