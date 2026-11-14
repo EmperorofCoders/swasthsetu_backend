@@ -552,7 +552,7 @@ def extract_document(
     content_type: str,
 ) -> dict[str, Any]:
     headers = {
-        "api-subscription-key": required_environment_variable("SARVAM_API_KEY")
+        "api-subscription-key": required_environment_variable("sk_rk0w58r8_49DlOaHDy40YUKC7jKd93gMY")
     }
     with document_path.open("rb") as document:
         submit = requests.post(
@@ -641,7 +641,7 @@ def save_extraction(
     clerk_user_id: str,
     patient_code: str,
 ) -> int:
-    database_url = required_environment_variable("DATABASE_URL")
+    database_url = required_environment_variable("postgresql://postgres:Supabase%40445456@db.fhzbdhoavlocadduczkn.supabase.co:5432/postgres")
     encrypted_record = get_data_protector().encrypt(
         json.dumps(
             {
@@ -746,8 +746,8 @@ def upload_report(
             detail="MAX_UPLOAD_BYTES must be positive.",
         )
 
-    required_environment_variable("DATABASE_URL")
-    required_environment_variable("SARVAM_API_KEY")
+    required_environment_variable("postgresql://postgres:Supabase%40445456@db.fhzbdhoavlocadduczkn.supabase.co:5432/postgres")
+    required_environment_variable("sk_rk0w58r8_49DlOaHDy40YUKC7jKd93gMY")
     get_data_protector()
 
     with tempfile.TemporaryDirectory(prefix="swasthsetu-upload-") as temporary_directory:
