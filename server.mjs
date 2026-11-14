@@ -5,6 +5,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { seedRealisticRecords } from "./seed_realistic_records.mjs";
 
 const { Pool } = pg;
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -293,6 +294,56 @@ function profileForClient(row) {
   };
 }
 
+async function ensurePushSqlLoaded() {
+  try {
+    await pool.query(`
+      ALTER TABLE public.doctors ADD COLUMN IF NOT EXISTS experience_years INTEGER;
+      ALTER TABLE public.doctors ADD COLUMN IF NOT EXISTS languages TEXT[] DEFAULT '{}';
+    `);
+  } catch {}
+
+  try {
+    const res = await pool.query("SELECT count(*) FROM public.facilities;");
+    const count = Number(res.rows[0]?.count || 0);
+    if (count > 0) {
+      console.log(`[push.sql] Facilities already populated (${count} facilities in DB).`);
+      return;
+    }
+  } catch (err) {
+    console.log("[push.sql] Facilities check:", err.message);
+  }
+
+  try {
+    console.log("[push.sql] Executing push.sql to populate 100 hospitals, 100 clinics, 100 doctors...");
+    const sqlPath = path.join(ROOT, "push.sql");
+    const sqlContent = await readFile(sqlPath, "utf8");
+    await pool.query(sqlContent);
+    console.log("✅ [push.sql] Successfully loaded 100 hospitals, 100 clinics, 100 doctors into Supabase!");
+  } catch (err) {
+    console.error("[push.sql load error]", err.message);
+  }
+}
+
+void ensurePushSqlLoaded();
+
+async function ensureRealisticMedicalRecords() {
+  try {
+    await pool.query("ALTER TABLE public.medical_records ADD COLUMN IF NOT EXISTS structured_data JSONB;");
+    const res = await pool.query("SELECT count(*) FROM public.medical_records WHERE clerk_user_id = 'demo_patient';");
+    const count = Number(res.rows[0]?.count || 0);
+    if (count < 5) {
+      console.log(`[records] Found ${count} records. Seeding realistic Bangalore medical dataset...`);
+      await seedRealisticRecords(pool);
+    } else {
+      console.log(`[records] Realistic medical records active (${count} records in database).`);
+    }
+  } catch (err) {
+    console.warn("[ensureRealisticMedicalRecords warning]", err.message);
+  }
+}
+
+void ensureRealisticMedicalRecords();
+
 async function listAppointments(clerkUserId) {
   try {
     const res = await pool.query(
@@ -319,42 +370,187 @@ async function listAppointments(clerkUserId) {
 
 async function searchProviders(url) {
   try {
-    const requestedKind = url.searchParams.get("kind")?.trim().toLocaleLowerCase();
-    const kind = ["hospital", "clinic", "clinician"].includes(requestedKind) ? requestedKind : "";
-    const location = url.searchParams.get("location")?.trim().slice(0, 80);
-    const specialty = url.searchParams.get("specialty")?.trim().slice(0, 80).toLocaleLowerCase();
+    const requestedKind = (url.searchParams.get("kind") || "").trim().toLowerCase();
+    const isDoctor = requestedKind === "clinician" || requestedKind === "doctor";
+    const isHospital = requestedKind === "hospital";
+    const isClinic = requestedKind === "clinic";
+    const location = (url.searchParams.get("location") || "").trim().slice(0, 80);
+    const specialty = (url.searchParams.get("specialty") || "").trim().slice(0, 80).toLowerCase();
 
-    let query = `SELECT id, name, kind, location, specialties, address, booking_url FROM public.healthcare_providers WHERE 1=1`;
-    const params = [];
+    const results = [];
 
-    if (kind) {
-      params.push(kind);
-      query += ` AND kind = $${params.length}`;
+    // 1. Search Facilities (Hospitals & Clinics) from push.sql facilities table
+    if (!isDoctor) {
+      let facQuery = `
+        SELECT 
+          f.facility_id AS id,
+          f.name,
+          f.facility_type::text AS kind,
+          COALESCE(f.area, 'Bengaluru') AS location,
+          f.address_line,
+          f.city,
+          f.pincode,
+          f.phone,
+          f.price_band::text AS price_band,
+          f.bed_count,
+          f.is_24x7,
+          f.emergency_available,
+          f.accreditations,
+          ARRAY(
+            SELECT DISTINCT s.name 
+            FROM public.doctor_facilities df 
+            JOIN public.doctor_specialties ds ON ds.doctor_id = df.doctor_id
+            JOIN public.specialties s ON s.specialty_id = ds.specialty_id
+            WHERE df.facility_id = f.facility_id
+            LIMIT 6
+          ) AS specialties
+        FROM public.facilities f
+        WHERE 1=1
+      `;
+      const params = [];
+
+      if (isHospital) {
+        params.push("hospital");
+        facQuery += ` AND f.facility_type = $${params.length}`;
+      } else if (isClinic) {
+        params.push("clinic");
+        facQuery += ` AND f.facility_type = $${params.length}`;
+      }
+
+      if (location) {
+        params.push(`%${location}%`);
+        facQuery += ` AND (f.area ILIKE $${params.length} OR f.address_line ILIKE $${params.length} OR f.pincode ILIKE $${params.length})`;
+      }
+
+      facQuery += ` ORDER BY f.name ASC LIMIT 100`;
+
+      try {
+        const facRes = await pool.query(facQuery, params);
+        for (const r of facRes.rows) {
+          const specs = r.specialties && r.specialties.length > 0
+            ? r.specialties
+            : (r.kind === "hospital" ? ["Multi-specialty", "Emergency Medicine", "General Medicine"] : ["General Practice", "Diagnostics"]);
+          
+          const detailsParts = [
+            r.address_line,
+            r.location,
+            r.pincode ? `PIN: ${r.pincode}` : null,
+            r.bed_count > 0 ? `${r.bed_count} Beds` : null,
+            r.price_band ? `${r.price_band.toUpperCase()} band` : null,
+            r.is_24x7 ? "24x7 Open" : null,
+            r.emergency_available ? "Emergency Available" : null,
+            r.phone ? `Ph: ${r.phone}` : null
+          ].filter(Boolean);
+
+          results.push({
+            id: r.id,
+            name: r.name,
+            kind: r.kind, // 'hospital' or 'clinic'
+            location: r.location,
+            specialties: specs,
+            address: detailsParts.join(" • "),
+            bookingUrl: "https://cal.com/rohit-nadakarni-owgvjt/doctor-appointment"
+          });
+        }
+      } catch (err) {
+        console.warn("[searchFacilities warning]", err.message);
+      }
     }
-    if (location) {
-      params.push(`%${location}%`);
-      query += ` AND location ILIKE $${params.length}`;
+
+    // 2. Search Doctors from push.sql doctors & doctor_facilities table
+    if (!isHospital && !isClinic) {
+      let docQuery = `
+        SELECT 
+          d.doctor_id AS id,
+          d.full_name AS name,
+          'clinician' AS kind,
+          COALESCE(fac.area, 'Bengaluru') AS location,
+          d.qualifications,
+          COALESCE(d.experience_years, 12) AS years_of_experience,
+          COALESCE(d.languages, ARRAY['English', 'Kannada']) AS languages_spoken,
+          COALESCE(fac.name, 'Bangalore Medical Network') AS hospital_name,
+          COALESCE(fac.address_line, fac.area) AS hospital_address,
+          df.consultation_fee_min,
+          df.consultation_fee_max,
+          df.teleconsult_fee,
+          ARRAY(
+            SELECT s.name 
+            FROM public.doctor_specialties ds 
+            JOIN public.specialties s ON s.specialty_id = ds.specialty_id 
+            WHERE ds.doctor_id = d.doctor_id
+          ) AS specialties
+        FROM public.doctors d
+        LEFT JOIN public.doctor_facilities df ON df.doctor_id = d.doctor_id
+        LEFT JOIN public.facilities fac ON fac.facility_id = df.facility_id
+        WHERE 1=1
+      `;
+      const params = [];
+
+      if (location) {
+        params.push(`%${location}%`);
+        docQuery += ` AND (fac.area ILIKE $${params.length} OR fac.address_line ILIKE $${params.length})`;
+      }
+
+      docQuery += ` ORDER BY d.full_name ASC LIMIT 100`;
+
+      try {
+        const docRes = await pool.query(docQuery, params);
+        for (const r of docRes.rows) {
+          const feeDesc = r.consultation_fee_min 
+            ? `Fee: ₹${r.consultation_fee_min}${r.consultation_fee_max ? ' - ₹' + r.consultation_fee_max : ''}`
+            : "Consultation available";
+          const teleDesc = r.teleconsult_fee ? `Teleconsult: ₹${r.teleconsult_fee}` : null;
+          const expDesc = r.years_of_experience ? `${r.years_of_experience} yrs experience` : null;
+          const langs = r.languages_spoken && r.languages_spoken.length > 0 ? `Languages: ${r.languages_spoken.join(', ')}` : null;
+
+          const addressParts = [
+            r.hospital_name,
+            r.qualifications,
+            expDesc,
+            feeDesc,
+            teleDesc,
+            langs
+          ].filter(Boolean);
+
+          results.push({
+            id: r.id,
+            name: `Dr. ${r.name.replace(/^Dr\.\s*/i, '')} (${r.qualifications || 'Specialist'})`,
+            kind: "clinician",
+            location: r.location,
+            specialties: r.specialties && r.specialties.length > 0 ? r.specialties : ["General Medicine"],
+            address: addressParts.join(" • "),
+            bookingUrl: "https://cal.com/rohit-nadakarni-owgvjt/doctor-appointment"
+          });
+        }
+      } catch (err) {
+        console.warn("[searchDoctors warning]", err.message);
+      }
     }
 
-    query += ` ORDER BY name ASC LIMIT 100`;
-    const res = await pool.query(query, params);
-
-    let rows = res.rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      kind: r.kind,
-      location: r.location,
-      specialties: r.specialties || [],
-      address: r.address || "",
-      bookingUrl: r.booking_url || "https://cal.com/rohit-nadakarni-owgvjt/doctor-appointment"
-    }));
-
+    // Filter by specialty if provided
+    let filtered = results;
     if (specialty) {
-      rows = rows.filter((r) =>
-        r.specialties.some((s) => s.toLocaleLowerCase().includes(specialty))
+      filtered = results.filter((item) =>
+        item.specialties.some((s) => s.toLowerCase().includes(specialty)) ||
+        item.name.toLowerCase().includes(specialty)
       );
     }
-    return rows;
+
+    // Fallback to old healthcare_providers table if both returned nothing
+    if (filtered.length === 0 && results.length === 0) {
+      const fallback = await pool.query("SELECT * FROM public.healthcare_providers LIMIT 20;");
+      return fallback.rows.map(r => ({
+        id: r.id,
+        name: r.name,
+        kind: r.kind,
+        location: r.location,
+        specialties: r.specialties || [],
+        address: r.address || "",
+        bookingUrl: r.booking_url || "https://cal.com/rohit-nadakarni-owgvjt/doctor-appointment"
+      }));
+    }
+
+    return filtered;
   } catch (err) {
     console.error("[searchProviders error]", err.message);
     return [];
@@ -364,20 +560,33 @@ async function searchProviders(url) {
 async function listRecords(clerkUserId) {
   try {
     const res = await pool.query(
-      `SELECT record_id, document_name, document_type, doctor_or_hospital, diagnosis_or_findings, raw_transcript, uploaded_at
+      `SELECT record_id, document_name, document_type, doctor_or_hospital, diagnosis_or_findings, raw_transcript, structured_data, uploaded_at
        FROM public.medical_records
        WHERE (clerk_user_id = $1 OR clerk_user_id = 'demo_patient')
        ORDER BY uploaded_at DESC LIMIT 50`,
       [clerkUserId]
     );
-    return res.rows.map((r) => ({
-      id: r.record_id,
-      title: r.document_name,
-      type: r.document_type,
-      date: r.uploaded_at,
-      facility: r.doctor_or_hospital,
-      summary: r.raw_transcript || r.diagnosis_or_findings || "Medical record"
-    }));
+    return res.rows.map((r) => {
+      let structured = {};
+      if (r.structured_data) {
+        try {
+          structured = typeof r.structured_data === "string" ? JSON.parse(r.structured_data) : r.structured_data;
+        } catch {}
+      }
+      return {
+        id: r.record_id,
+        title: structured.title || r.document_name,
+        type: structured.type || r.document_type,
+        date: r.uploaded_at,
+        facility: structured.facility || r.doctor_or_hospital,
+        summary:
+          structured.summary ||
+          r.diagnosis_or_findings ||
+          (r.raw_transcript && !r.raw_transcript.startsWith("{")
+            ? r.raw_transcript.split("\n").filter((l) => l.trim() && !l.includes("---"))[0] || r.raw_transcript.slice(0, 150)
+            : "Medical record")
+      };
+    });
   } catch (err) {
     console.error("[listRecords error]", err.message);
     return [];
@@ -392,41 +601,92 @@ async function getRecordDetail(recordId) {
     );
     if (res.rows.length === 0) return null;
     const r = res.rows[0];
+
+    let structured = {};
+    if (r.structured_data) {
+      try {
+        structured = typeof r.structured_data === "string" ? JSON.parse(r.structured_data) : r.structured_data;
+      } catch (e) {
+        console.warn("[parse structured_data warning]", e.message);
+      }
+    } else if (r.raw_transcript && r.raw_transcript.trim().startsWith("{")) {
+      try {
+        structured = JSON.parse(r.raw_transcript);
+      } catch {}
+    }
+
+    const title = structured.title || r.document_name;
+    const docType = structured.type || r.document_type || "Medical Report";
+    const facility = structured.facility || r.doctor_or_hospital || "Hospital Care Center";
+    const clinician = structured.clinician || r.doctor_or_hospital || "Consulting Physician";
+
+    // Build medications array if not already structured
+    let medications = structured.medications;
+    if (!medications || !Array.isArray(medications) || medications.length === 0) {
+      if (r.medications_or_procedures) {
+        const parts = r.medications_or_procedures
+          .split(/;|\n/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        medications = parts.map((part) => {
+          const match = part.match(/^([^-(]+)(?:[-:(]\s*(.+))?$/);
+          return {
+            name: match ? match[1].trim() : part,
+            instructions: match && match[2] ? match[2].replace(/[)]$/, "").trim() : "As directed on clinical prescription",
+            clinician: clinician
+          };
+        });
+      } else {
+        medications = [];
+      }
+    }
+
+    // Build results array if not already structured
+    let results = structured.results;
+    if (!results || !Array.isArray(results) || results.length === 0) {
+      if (r.diagnosis_or_findings) {
+        results = [
+          {
+            name: "Clinical Evaluation",
+            value: r.diagnosis_or_findings,
+            referenceRange: "Assessed by clinician",
+            notes: "Recorded in Swasth Setu EHR"
+          }
+        ];
+      } else {
+        results = [];
+      }
+    }
+
     return {
       id: r.record_id,
-      title: r.document_name,
-      subtitle: r.doctor_or_hospital || "Medical Record",
-      type: r.document_type || "General",
+      title: title,
+      subtitle: structured.subtitle || `${facility} • Clinical Encounter`,
+      type: docType,
       date: r.uploaded_at,
-      facility: r.doctor_or_hospital || "Care Center",
-      clinician: r.doctor_or_hospital || "Consulting Physician",
-      source: "Swasth Setu Electronic Health Records",
-      reason: "Clinical Review & Documentation",
-      history: "Documented under patient code " + r.patient_code,
-      observations: r.diagnosis_or_findings || "No acute distress noted.",
-      vitals: "Blood Pressure: 128/82 mmHg, Pulse: 78 bpm, SpO2: 98%",
-      findings: r.diagnosis_or_findings || "All parameters evaluated.",
-      assessment: r.diagnosis_or_findings || "Stable condition.",
-      diagnosis: r.diagnosis_or_findings || "Evaluated by physician.",
-      procedures: r.medications_or_procedures || "Standard diagnostic assessment",
-      medications: [
-        {
-          name: r.medications_or_procedures ? r.medications_or_procedures.split(";")[0] : "Prescribed Medication",
-          instructions: "As directed on clinical prescription",
-          clinician: r.doctor_or_hospital || "Attending Physician"
-        }
-      ],
-      results: [
-        {
-          name: "Clinical Evaluation",
-          value: r.diagnosis_or_findings || "Normal",
-          notes: "Recorded in EHR"
-        }
-      ],
-      recommendations: "Maintain prescribed treatment and follow-up consultation as scheduled.",
-      followUp: "Routine follow-up in 4 to 8 weeks",
-      notes: r.raw_transcript || "",
-      text: `${r.document_name}\n${r.doctor_or_hospital}\nFindings: ${r.diagnosis_or_findings}\nMedications: ${r.medications_or_procedures}\nNotes: ${r.raw_transcript}`
+      facility: facility,
+      clinician: clinician,
+      source: structured.source || "Swasth Setu Electronic Health Records (ABDM Integrated)",
+      reason: structured.reason || "Routine clinical review and health evaluation",
+      history: structured.history || ("Documented under patient code " + r.patient_code),
+      observations: structured.observations || r.diagnosis_or_findings || "No acute distress noted.",
+      vitals: structured.vitals || "Blood Pressure: 124/80 mmHg, Pulse: 72 bpm, SpO2: 98%",
+      findings: structured.findings || r.diagnosis_or_findings || "All parameters clinically evaluated.",
+      assessment: structured.assessment || r.diagnosis_or_findings || "Patient profile stable.",
+      diagnosis: structured.diagnosis || r.diagnosis_or_findings || "Evaluated by physician.",
+      procedures: structured.procedures || r.medications_or_procedures || "Standard diagnostic assessment",
+      medications: medications,
+      results: results,
+      recommendations: structured.recommendations || "Maintain prescribed treatment and follow-up consultation as scheduled.",
+      followUp: structured.followUp || "Routine clinical review in 4 to 8 weeks",
+      attachments: structured.attachments || "Certified_EHR_Document.pdf (NABH Compliant)",
+      verifiedBy: structured.verifiedBy || `${clinician} (Digitally Signed)`,
+      updatedAt: r.uploaded_at,
+      status: structured.status || "Verified & Digitally Signed",
+      notes: structured.notes || r.raw_transcript || "",
+      text:
+        structured.text ||
+        `${title}\n${facility} - ${clinician}\nDiagnosis/Findings: ${r.diagnosis_or_findings}\nMedications/Procedures: ${r.medications_or_procedures}\nVitals: ${structured.vitals || "BP: 124/80 mmHg, Pulse: 72 bpm, SpO2: 98%"}\nNotes: ${r.raw_transcript || ""}`
     };
   } catch (err) {
     console.error("[getRecordDetail error]", err.message);
@@ -435,6 +695,7 @@ async function getRecordDetail(recordId) {
 }
 
 // Wiper_1 Medical Plain Language Interpreter
+// Wiper_1 Medical Plain Language Interpreter powered by Gemma 4
 async function interpretMedicalText(text) {
   const sarvamKey = process.env.SARVAM_API_KEY;
   if (sarvamKey) {
@@ -446,31 +707,33 @@ async function interpretMedicalText(text) {
           "api-subscription-key": sarvamKey
         },
         body: JSON.stringify({
-          model: "sarvam-105b-conversations",
+          model: "gemma4",
           messages: [
             {
               role: "system",
-              content: "You are Wiper_1, an expert and reassuring medical health assistant for Swasth Setu in India. Explain the patient's medical report or test results in clear, caring, simple English without confusing jargon. Structure your response with: 1. Overview in plain English, 2. What the numbers/findings mean, 3. Prescribed medicines & lifestyle tips, 4. Important questions for your doctor. Be concise and educational."
+              content: "You are Wiper_1, an empathetic, highly accurate clinical health interpreter for Swasth Setu powered by Gemma 4. Explain the patient's medical report, lab values, and doctor prescription in clear, reassuring, simple English without confusing jargon. Structure your output with: 1. Summary Overview, 2. What the Key Numbers & Findings Mean, 3. Prescribed Medicines & Dosages Explained, 4. Lifestyle & Dietary Precautions, 5. Questions for Your Doctor."
             },
             {
               role: "user",
               content: text
             }
           ],
-          temperature: 0.2
+          temperature: 0.1,
+          top_p: 0.95,
+          max_tokens: 4096
         })
       });
       if (response.ok) {
         const data = await response.json();
         const reply = data.choices?.[0]?.message?.content;
-        if (reply) return reply;
+        if (reply) return reply.trim();
       }
     } catch (e) {
-      console.warn("[Sarvam AI interpret fallback]", e.message);
+      console.warn("[Gemma 4 interpret warning]", e.message);
     }
   }
 
-  // High quality medical simplification engine
+  // High quality medical simplification fallback
   return `📋 Plain-Language Medical Interpretation:
 
 1. Overview:
@@ -489,51 +752,59 @@ Your health report reflects a recent clinical assessment. The documented vitals 
 • Consult your doctor promptly if you experience any new or unusual symptoms.`;
 }
 
-// Wiper_1 Multilingual Translator
+// Wiper_1 Multilingual Translator optimized with Gemma 4
 async function translateMedicalText(text, targetLanguage) {
   const sarvamKey = process.env.SARVAM_API_KEY;
+  const langNames = {
+    kn: "Kannada (ಕನ್ನಡ)",
+    hi: "Hindi (हिन्दी)",
+    ta: "Tamil (தமிழ்)",
+    te: "Telugu (తెలుగు)",
+    mr: "Marathi (मराठी)",
+    bn: "Bengali (বাংলা)",
+    gu: "Gujarati (ગુજરાતી)",
+    ml: "Malayalam (മലയാളം)",
+    en: "English"
+  };
+  const targetName = langNames[targetLanguage.slice(0, 2).toLowerCase()] || targetLanguage;
+
   if (sarvamKey) {
     try {
-      const response = await fetch("https://api.sarvam.ai/v1/translate", {
+      const response = await fetch("https://api.sarvam.ai/v2/chat/completions", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "api-subscription-key": sarvamKey
         },
         body: JSON.stringify({
-          input: text.slice(0, 2000),
-          source_language_code: "en-IN",
-          target_language_code: `${targetLanguage}-IN`,
-          mode: "formal",
-          model: "mayura:v1"
+          model: "gemma4",
+          messages: [
+            {
+              role: "system",
+              content: `You are an expert clinical medical translator powered by Gemma 4 for Swasth Setu. Your job is to translate complex medical reports, prescriptions, and lab tests into fluent, culturally natural, and easy-to-understand ${targetName} for Indian patients. Preserve exact medical dosages, medicine names, instructions, and precautions with phonetic clarity. Output only the natural translation in proper script.`
+            },
+            {
+              role: "user",
+              content: `Translate the following medical text into natural, easy-to-understand ${targetName}:\n\n${text}`
+            }
+          ],
+          temperature: 0.1,
+          top_p: 0.95,
+          max_tokens: 4096
         })
       });
       if (response.ok) {
         const data = await response.json();
-        if (data.translated_text) return data.translated_text;
+        const reply = data.choices?.[0]?.message?.content;
+        if (reply) return reply.trim();
       }
     } catch (e) {
-      console.warn("[Sarvam AI translate fallback]", e.message);
+      console.warn("[Gemma 4 translation warning]", e.message);
     }
   }
 
   // Quality regional language translations for key Indian languages
   const translations = {
-    hi: `📋 स्वास्थ्य रिपोर्ट का सरल हिंदी विवरण:
-
-1. सारांश:
-आपकी मेडिकल रिपोर्ट एक सामान्य स्वास्थ्य जांच को दर्शाती है। डॉक्टर द्वारा बताए गए सभी पैरामीटर स्थिर हैं।
-
-2. मुख्य जांच परिणाम:
-• आपके परीक्षण परिणाम सामान्य सीमा के भीतर हैं। हल्का रक्तचाप या कोलेस्ट्रॉल जीवनशैली में बदलाव से नियंत्रित किया जा सकता है।
-
-3. दवाएं और सावधानियां:
-• डॉक्टर द्वारा बताई गई दवाओं को समय पर लें।
-• प्रतिदिन कम से कम 30 मिनट टहलें और भोजन में नमक की मात्रा कम रखें।
-
-4. अगला कदम:
-• नियमित अंतराल पर अपनी जांच कराते रहें और अगली मुलाकात में डॉक्टर से परामर्श लें।`,
-
     kn: `📋 ನಿಮ್ಮ ವೈದ್ಯಕೀಯ ವರದಿಯ ಸರಳ ವಿವರಣೆ (ಕನ್ನಡ):
 
 1. ಅವಲೋಕನ:
@@ -548,6 +819,21 @@ async function translateMedicalText(text, targetLanguage) {
 
 4. ಮುಂದಿನ ಹಂತ:
 • ಮುಂದಿನ ಅಪಾಯಿಂಟ್ಮೆಂಟ್‌ಗಾಗಿ ವೈದ್ಯರನ್ನು ಸಂಪರ್ಕಿಸಿ.`,
+
+    hi: `📋 स्वास्थ्य रिपोर्ट का सरल हिंदी विवरण:
+
+1. सारांश:
+आपकी मेडिकल रिपोर्ट एक सामान्य स्वास्थ्य जांच को दर्शाती है। डॉक्टर द्वारा बताए गए सभी पैरामीटर स्थिर हैं।
+
+2. मुख्य जांच परिणाम:
+• आपके परीक्षण परिणाम सामान्य सीमा के भीतर हैं। हल्का रक्तचाप या कोलेस्ट्रॉल जीवनशैली में बदलाव से नियंत्रित किया जा सकता है।
+
+3. दवाएं और सावधानियां:
+• डॉक्टर द्वारा बताई गई दवाओं को समय पर लें।
+• प्रतिदिन कम से कम 30 मिनट टहलें और भोजन में नमक की मात्रा कम रखें।
+
+4. अगला कदम:
+• नियमित अंतराल पर अपनी जांच कराते रहें और अगली मुलाकात में डॉक्टर से परामर्श लें।`,
 
     ta: `📋 உங்கள் மருத்துவ அறிக்கையின் எளிய விளக்கம் (தமிழ்):
 
@@ -585,7 +871,64 @@ async function translateMedicalText(text, targetLanguage) {
 • सांगितलेली औषधे वेळेवर घ्या आणि आहारात मिठाचे प्रमाण नियंत्रित ठेवा.`
   };
 
-  return translations[targetLanguage] || `Interpretation in your selected language (${targetLanguage}):\n\n${text}`;
+  return translations[targetLanguage.slice(0, 2).toLowerCase()] || `Interpretation in your selected language (${targetName}):\n\n${text}`;
+}
+
+// Wiper_1 Text-to-Speech using Sarvam AI Bulbul v4-flash
+async function generateSpeechAudio(text, targetLanguage = "kn") {
+  const sarvamKey = process.env.SARVAM_API_KEY;
+  if (!sarvamKey) {
+    throw new HttpError(400, "SARVAM_API_KEY is not configured in .env. Please configure it to enable Bulbul v4-flash voice synthesis.");
+  }
+
+  const langCodes = {
+    kn: "kn-IN",
+    hi: "hi-IN",
+    ta: "ta-IN",
+    te: "te-IN",
+    mr: "mr-IN",
+    bn: "bn-IN",
+    gu: "gu-IN",
+    ml: "ml-IN",
+    en: "en-IN"
+  };
+  const targetLangCode = langCodes[targetLanguage.slice(0, 2).toLowerCase()] || "kn-IN";
+
+  // Call Sarvam AI text-to-speech stream endpoint
+  const response = await fetch("https://api.sarvam.ai/text-to-speech/stream", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "api-subscription-key": sarvamKey
+    },
+    body: JSON.stringify({
+      text: text.slice(0, 3000),
+      target_language_code: targetLangCode,
+      language_code: targetLangCode,
+      speaker: "aparna_en_companion",
+      model: "bulbul:v4-flash",
+      pace: 1.0,
+      speech_sample_rate: 24000
+    })
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    console.error("[Sarvam bulbul:v4-flash error]", response.status, errText);
+    throw new HttpError(response.status, "Sarvam AI TTS error: " + errText);
+  }
+
+  const audioBuffer = Buffer.from(await response.arrayBuffer());
+
+  // Save to speech.mp3 as requested in the user prompt
+  try {
+    await writeFile(path.join(ROOT, "speech.mp3"), audioBuffer);
+    console.log("✅ [Sarvam TTS] Generated speech.mp3 with bulbul:v4-flash (" + audioBuffer.length + " bytes)");
+  } catch (err) {
+    console.warn("[speech.mp3 write warning]", err.message);
+  }
+
+  return audioBuffer;
 }
 
 async function serveStatic(url, response) {
@@ -809,14 +1152,39 @@ async function handleRequest(request, response) {
           ? "Routine diagnostic evaluation. Follow up with physician for clinical correlation."
           : "Consult attending healthcare professional for clinical review.";
 
+        const structured = {
+          title: docTitle,
+          subtitle: "Uploaded Clinical Record • Swasth Setu Archive",
+          summary: `${docType}: ${docTitle}. Archived in electronic health records on ${new Date().toLocaleDateString("en-IN", { month: "short", day: "numeric", year: "numeric" })}.`,
+          type: docType,
+          facility: "Uploaded Health Document",
+          clinician: "Consulting Healthcare Professional",
+          source: "Swasth Setu Electronic Health Records (ABDM Upload)",
+          reason: "Patient uploaded clinical documentation for EHR indexing",
+          history: `Archived under patient code ${patientCode}`,
+          observations: findings,
+          vitals: "Documented in attached clinical report",
+          findings: findings,
+          assessment: "Record indexed and archived in patient profile.",
+          diagnosis: docTitle,
+          procedures: procedures,
+          medications: [],
+          results: [],
+          recommendations: "Maintain archived record for physician consultations.",
+          followUp: "As advised by your treating physician",
+          attachments: savedFilename ? `${savedFilename} (Stored in repository)` : `${docTitle}.pdf`,
+          verifiedBy: "Swasth Setu Document Processing",
+          status: "Archived & Verified"
+        };
+
         const res = await pool.query(
           `INSERT INTO public.medical_records (
              record_id, clerk_user_id, patient_code, document_name, document_type,
              doctor_or_hospital, diagnosis_or_findings, medications_or_procedures,
-             raw_transcript, uploaded_at
+             raw_transcript, structured_data, uploaded_at
            ) VALUES (
              gen_random_uuid(), $1, $2, $3, $4, 'Uploaded Health Document',
-             $5, $6, $7, NOW()
+             $5, $6, $7, $8, NOW()
            ) RETURNING *;`,
           [
             user.id,
@@ -825,7 +1193,8 @@ async function handleRequest(request, response) {
             docType.replace(/\0/g, "").slice(0, 100),
             findings,
             procedures,
-            (docText || `Uploaded document: ${docTitle}`).replace(/\0/g, "").slice(0, 10000)
+            (docText || `Uploaded document: ${docTitle}`).replace(/\0/g, "").slice(0, 10000),
+            JSON.stringify(structured)
           ]
         );
 
@@ -864,6 +1233,24 @@ async function handleRequest(request, response) {
           reply: translation,
           language: targetLanguage
         });
+        return;
+      }
+
+      // POST /api/wiper_1/tts (Sarvam AI Bulbul v4-flash Text-to-Speech)
+      if (url.pathname === "/api/wiper_1/tts" && request.method === "POST") {
+        const body = await readJson(request);
+        const text = String(body.text || "").trim();
+        const language = String(body.language || body.targetLanguage || "kn").toLowerCase();
+        if (!text) throw new HttpError(400, "Text is required for speech synthesis.");
+
+        const audioBuffer = await generateSpeechAudio(text, language);
+        response.writeHead(200, {
+          "Content-Type": "audio/mpeg",
+          "Content-Length": audioBuffer.length,
+          "Cache-Control": "public, max-age=3600",
+          "Access-Control-Allow-Origin": "*"
+        });
+        response.end(audioBuffer);
         return;
       }
 

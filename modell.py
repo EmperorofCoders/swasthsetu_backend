@@ -198,7 +198,7 @@ def translate_text(text: str, target_language_code: str) -> str:
         target_language_code=target_language_code,
         model=os.getenv("TRANSLATION_MODEL", DEFAULT_TRANSLATION_MODEL),
         numerals_format=os.getenv("NUMERALS_FORMAT", "international"),
-        mode=os.getenv("TRANSLATION_MODE", "formal"),
+        mode=os.getenv("TRANSLATION_MODE", "modern-colloquial"),
     )
     return response.translated_text
 

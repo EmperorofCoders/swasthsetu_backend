@@ -1,6 +1,12 @@
-fastapi
-uvicorn
-python-multipart
-supabase
+requests>=2.31.0
 sarvamai==0.1.31a4
-requests
+streamlit>=1.36.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+supabase
+PyJWT[crypto]>=2.8.0
+psycopg[binary]>=3.2.0
+python-dotenv>=1.0.1
+cryptography>=42.0.0
+paramiko>=3.4.0
